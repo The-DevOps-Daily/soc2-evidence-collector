@@ -19,7 +19,7 @@ Write-up: _link added when the post is published_.
 | Criterion | Control | Evidence |
 | --- | --- | --- |
 | CC8.1 | Changes to the default branch go through a pull request | branch rules and classic protection |
-| CC8.1 | Every merged change was tested before the merge | each required check on the pull request's head commit, passed before the merge |
+| CC8.1 | Every merged change was tested before the merge | the last run of each required check on the pull request's head commit that finished before the merge |
 | CC8.1 | Every merged change was approved by someone other than its author | each reviewer's last decision before the merge, for the merged commit |
 | CC8.1 | Nothing reached the default branch without a pull request | each commit's merged PR into that branch, and the branch's activity log (pushes, force pushes) |
 | CC7.1 | Dependency vulnerability alerts are on | Dependabot setting |
@@ -31,7 +31,8 @@ Every control is `pass`, `fail`, `needs a person` or `incomplete`. Missing data 
 
 - alerts the token cannot read, or alerts without a known severity;
 - any list cut at its limit (commits at 300, alerts at 10,000, other lists at 1,000);
-- a branch activity log that does not reach back to the start of the window.
+- a branch activity log that does not reach back to the start of the window;
+- a pull request or activity entry for a branch other than the one asked for.
 
 Any other API error stops the run. A required check that reports through the older commit status API, not as a check run, shows as `missing`.
 

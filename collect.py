@@ -18,10 +18,12 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
@@ -100,6 +102,22 @@ def parse_time(s):
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
+def seg(value):
+    """One URL path segment. Branch names can hold '/', '?', '#' or '&'."""
+    return urllib.parse.quote(str(value), safe="")
+
+
+def query(path, **params):
+    return path + "?" + urllib.parse.urlencode(params)
+
+
+def only_ref(items, ref_of, expected):
+    """(items on the expected ref, whether all were). An item for another ref
+    means the API did not answer the question we asked."""
+    kept = [i for i in items if ref_of(i) == expected]
+    return kept, len(kept) == len(items)
+
+
 # --- Classification: pure functions, covered by tests/test_collect.py ---
 
 
@@ -149,21 +167,21 @@ def required_contexts(rules, protection):
 def checks_at_merge(pr, check_runs, required):
     """'passed', 'failed', 'not finished' or 'missing' for the required checks when the PR was merged.
 
-    Each required check needs a run with its name (and app, when the rule names
-    one) on the PR's head commit that passed before the merge. A run that
-    finished after the merge did not gate it, and a passing run of some other
-    check does not stand in for a required one.
+    Each required check is judged by its latest run on the PR's head commit
+    (with the check's name, and app when the rule names one) that finished at
+    or before the merge, so an earlier pass cannot hide a later failure. A run
+    that finished after the merge did not gate it, and a passing run of some
+    other check does not stand in for a required one.
     """
     merged = parse_time(pr["merged_at"])
     states = []
     for name, app in required:
         runs = [c for c in check_runs
                 if c["name"] == name and (app is None or (c.get("app") or {}).get("id") == app)]
-        before = [c for c in runs if c.get("completed_at") and parse_time(c["completed_at"]) <= merged]
-        if any(c["conclusion"] in PASSING for c in before):
-            states.append("passed")
-        elif before:
-            states.append("failed")
+        before = sorted((c for c in runs if c.get("completed_at") and parse_time(c["completed_at"]) <= merged),
+                        key=lambda c: parse_time(c["completed_at"]))
+        if before:
+            states.append("passed" if before[-1]["conclusion"] in PASSING else "failed")
         else:
             states.append("not finished" if runs else "missing")
     return next((s for s in ("missing", "failed", "not finished") if s in states), "passed")
@@ -268,26 +286,29 @@ def collect(gh, repo, days, sla_days, out_root):
         saved.append(path)
 
     started = time.monotonic()
-    _, meta = gh.get(f"/repos/{repo}", allow=())
+    base = f"/repos/{repo}"
+    _, meta = gh.get(base, allow=())
     save("repository", meta)
     branch = meta["default_branch"]
 
-    _, rules = gh.get(f"/repos/{repo}/rules/branches/{branch}")
+    _, rules = gh.get(f"{base}/rules/branches/{seg(branch)}")
     save("branch-rules", rules)
-    status, protection = gh.get(f"/repos/{repo}/branches/{branch}/protection")
+    status, protection = gh.get(f"{base}/branches/{seg(branch)}/protection")
     save("branch-protection-classic", protection if status == 200 else {"status": status})
     required = required_contexts(rules, protection)
 
     pulls, prs_complete = gh.follow(
-        f"/repos/{repo}/pulls?state=closed&base={branch}&sort=updated&direction=desc",
+        query(f"{base}/pulls", state="closed", base=branch, sort="updated", direction="desc"),
         stop=lambda p: parse_time(p["updated_at"]) < since,
     )
+    pulls, on_branch = only_ref(pulls, lambda p: (p.get("base") or {}).get("ref"), branch)
+    prs_complete = prs_complete and on_branch
     merged = [p for p in pulls if p.get("merged_at") and parse_time(p["merged_at"]) >= since]
     pr_rows = []
     for p in merged:
-        reviews, reviews_complete = gh.follow(f"/repos/{repo}/pulls/{p['number']}/reviews")
-        # filter=all keeps runs that a later re-run replaced, so a pass before the merge is still visible.
-        runs, runs_complete = gh.follow(f"/repos/{repo}/commits/{p['head']['sha']}/check-runs?filter=all",
+        reviews, reviews_complete = gh.follow(f"{base}/pulls/{seg(p['number'])}/reviews")
+        # filter=all keeps runs that a later re-run replaced, so the run that gated the merge is still visible.
+        runs, runs_complete = gh.follow(query(f"{base}/commits/{seg(p['head']['sha'])}/check-runs", filter="all"),
                                         key="check_runs")
         pr_rows.append({
             "number": p["number"],
@@ -306,27 +327,29 @@ def collect(gh, repo, days, sla_days, out_root):
         })
 
     commits, commits_complete = gh.follow(
-        f"/repos/{repo}/commits?sha={branch}&since={since.strftime('%Y-%m-%dT%H:%M:%SZ')}", limit=300)
+        query(f"{base}/commits", sha=branch, since=since.strftime("%Y-%m-%dT%H:%M:%SZ")), limit=300)
     merged_numbers = {p["number"] for p in merged}
     direct = []
     for c in commits:
-        _, prs = gh.get(f"/repos/{repo}/commits/{c['sha']}/pulls")
+        _, prs = gh.get(f"{base}/commits/{seg(c['sha'])}/pulls")
         if not linked_to_merged_pr(prs, branch, merged_numbers):
             direct.append({"sha": c["sha"][:12], "date": c["commit"]["committer"]["date"],
                            "message": c["commit"]["message"].splitlines()[0][:80]})
     save("default-branch-commits-without-pr", direct)
 
     # Every update to the branch ref, including force pushes that left no commit behind.
-    activity, activity_complete = gh.follow(f"/repos/{repo}/activity?ref=refs/heads/{branch}",
+    activity, activity_complete = gh.follow(query(f"{base}/activity", ref=f"refs/heads/{branch}"),
                                             stop=lambda a: parse_time(a["timestamp"]) < since)
+    activity, on_branch = only_ref(activity, lambda a: a.get("ref"), f"refs/heads/{branch}")
+    activity_complete = activity_complete and on_branch
     updates = ref_updates_outside_prs(activity, since)
     save("branch-activity", [{"type": a["activity_type"], "timestamp": a["timestamp"],
                               "actor": (a.get("actor") or {}).get("login"),
                               "before": a.get("before"), "after": a.get("after")} for a in activity])
 
-    alerts_on, _ = gh.get(f"/repos/{repo}/vulnerability-alerts")
-    alerts_status, _ = gh.get(f"/repos/{repo}/dependabot/alerts?state=open&per_page=1", allow=(403, 404))
-    alerts, alerts_complete = (gh.follow(f"/repos/{repo}/dependabot/alerts?state=open", limit=10000)
+    alerts_on, _ = gh.get(f"{base}/vulnerability-alerts")
+    alerts_status, _ = gh.get(query(f"{base}/dependabot/alerts", state="open", per_page=1), allow=(403, 404))
+    alerts, alerts_complete = (gh.follow(query(f"{base}/dependabot/alerts", state="open"), limit=10000)
                                if alerts_status == 200 else ([], False))
     save("dependabot-alerts-open", {"status": alerts_status, "complete": alerts_complete,
                                     "alerts": [{"number": a["number"], "created_at": a["created_at"],
@@ -336,12 +359,12 @@ def collect(gh, repo, days, sla_days, out_root):
                                                for a in alerts]})
 
     sec = meta.get("security_and_analysis") or {}
-    status, _ = gh.get(f"/repos/{repo}/secret-scanning/alerts?state=open&per_page=1", allow=(403, 404))
-    secrets = gh.follow(f"/repos/{repo}/secret-scanning/alerts?state=open")[0] if status == 200 else None
+    status, _ = gh.get(query(f"{base}/secret-scanning/alerts", state="open", per_page=1), allow=(403, 404))
+    secrets = gh.follow(query(f"{base}/secret-scanning/alerts", state="open"))[0] if status == 200 else None
     save("secret-scanning", {"settings": sec, "open_alerts": len(secrets) if secrets is not None else None})
 
-    collaborators, collaborators_complete = gh.follow(f"/repos/{repo}/collaborators?affiliation=all")
-    outside, outside_complete = gh.follow(f"/repos/{repo}/collaborators?affiliation=outside")
+    collaborators, collaborators_complete = gh.follow(query(f"{base}/collaborators", affiliation="all"))
+    outside, outside_complete = gh.follow(query(f"{base}/collaborators", affiliation="outside"))
     roles = {}
     for c in collaborators:
         roles[c["role_name"]] = roles.get(c["role_name"], 0) + 1
@@ -436,6 +459,8 @@ def main():
     ap.add_argument("--sla-days", type=int, default=30, help="days a critical/high alert may stay open (default 30)")
     ap.add_argument("--out", default="evidence", help="output folder (default evidence/)")
     args = ap.parse_args()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repo):
+        ap.error("repo must be OWNER/REPO")
 
     out, s = collect(GitHub(token()), args.repo, args.days, args.sla_days, args.out)
     print(f"{s['repository']}, last {s['window_days']} days: {s['evidence_files']} evidence files, "
