@@ -19,26 +19,36 @@ Write-up: _link added when the post is published_.
 | Criterion | Control | Evidence |
 | --- | --- | --- |
 | CC8.1 | Changes to the default branch go through a pull request | branch rules and classic protection |
-| CC8.1 | Every merged change was tested before the merge | check runs on the merged commit, finished before the merge |
-| CC8.1 | Every merged change was approved by someone other than its author | reviews that approved the merged commit, before the merge |
-| CC8.1 | Nothing reached the default branch without a pull request | each commit's merged PR into that branch |
+| CC8.1 | Every merged change was tested before the merge | each required check on the pull request's head commit, passed before the merge |
+| CC8.1 | Every merged change was approved by someone other than its author | each reviewer's last decision before the merge, for the merged commit |
+| CC8.1 | Nothing reached the default branch without a pull request | each commit's merged PR into that branch, and the branch's activity log (pushes, force pushes) |
 | CC7.1 | Dependency vulnerability alerts are on | Dependabot setting |
 | CC7.1 | No critical or high alert is open past the SLA (`--sla-days`, default 30) | open Dependabot alerts |
 | CC6.1 | Secret scanning and push protection are on | repository security settings |
 | CC6.3 | Repository access follows least privilege | collaborator roles (a person judges this one) |
 
-Every control is `pass`, `fail`, `needs a person` or `incomplete`. Missing data never passes: alerts the token cannot read, or a commit list cut at the limit, make a control `incomplete`.
+Every control is `pass`, `fail`, `needs a person` or `incomplete`. Missing data never passes. Partial data can still prove a failure, but these make a control `incomplete` instead of `pass`:
+
+- alerts the token cannot read, or alerts without a known severity;
+- any list cut at its limit (commits at 300, alerts at 10,000, other lists at 1,000);
+- a branch activity log that does not reach back to the start of the window.
+
+Any other API error stops the run. A required check that reports through the older commit status API, not as a check run, shows as `missing`.
+
+The pull request, commit and branch-activity controls look back over the window. The settings and the open alerts are read as they are when you run it, so run it on a schedule and keep every folder to cover a period.
 
 ## What you get
 
 ```
 evidence/OWNER__REPO/<UTC time>/
-  raw/*.json        every API response used, with the time it was collected
-  summary.json      the controls, the merged PRs and the commits without a PR
+  raw/*.json        the fields each control uses from each API response, with the time it was collected
+  summary.json      the controls, the merged PRs, and the commits and branch updates without a PR
   manifest.sha256   hashes of the raw files
 ```
 
-The raw files keep collaborator logins for the auditor. Keep `evidence/` out of public repositories (it is in `.gitignore`).
+The manifest shows whether a file changed after collection, as long as you store it where nobody can edit it.
+
+The raw files keep logins (PR authors, reviewers, collaborators) for the auditor. Keep `evidence/` out of public repositories (it is in `.gitignore`).
 
 ## The demo in this repository
 
