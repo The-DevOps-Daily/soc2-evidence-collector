@@ -81,6 +81,13 @@ class Checks(unittest.TestCase):
     def test_a_failure_before_the_merge(self):
         self.assertEqual(collect.checks_at_merge(PR, [run("failure")], TEST), "failed")
 
+    def test_only_the_last_run_before_the_merge_counts(self):
+        # An earlier pass can not hide a later failure, and a re-run that passed in time fixes an early failure.
+        pass_then_fail = [run(done="2026-10-19T11:00:00Z"), run("failure", done="2026-10-19T11:30:00Z")]
+        self.assertEqual(collect.checks_at_merge(PR, pass_then_fail, TEST), "failed")
+        fail_then_pass = [run("failure", done="2026-10-19T11:00:00Z"), run(done="2026-10-19T11:30:00Z")]
+        self.assertEqual(collect.checks_at_merge(PR, fail_then_pass, TEST), "passed")
+
     def test_another_check_passing_does_not_stand_in_for_the_required_one(self):
         self.assertEqual(collect.checks_at_merge(PR, [run(name="lint")], TEST), "missing")
         self.assertEqual(collect.checks_at_merge(PR, [], TEST), "missing")
@@ -180,6 +187,19 @@ class DirectPushes(unittest.TestCase):
         self.assertEqual(collect.direct_push_control([], [{}] * 300, False, [], True, "main")[0], "incomplete")
         self.assertEqual(collect.direct_push_control([], [{}] * 12, True, [], True, "main")[0], "pass")
         self.assertEqual(collect.direct_push_control([{"sha": "a"}], [{}] * 12, True, [], True, "main")[0], "fail")
+
+
+class Urls(unittest.TestCase):
+    def test_values_from_the_api_are_encoded(self):
+        self.assertEqual(collect.seg("release/1.0?x#y"), "release%2F1.0%3Fx%23y")
+        self.assertEqual(collect.query("/repos/o/r/activity", ref="refs/heads/a&b=c"),
+                         "/repos/o/r/activity?ref=refs%2Fheads%2Fa%26b%3Dc")
+
+    def test_items_for_another_ref_make_the_list_incomplete(self):
+        items = [{"ref": "refs/heads/main"}, {"ref": "refs/heads/other"}]
+        kept, all_matched = collect.only_ref(items, lambda i: i["ref"], "refs/heads/main")
+        self.assertEqual((kept, all_matched), ([{"ref": "refs/heads/main"}], False))
+        self.assertTrue(collect.only_ref(items[:1], lambda i: i["ref"], "refs/heads/main")[1])
 
 
 class Paging(unittest.TestCase):
