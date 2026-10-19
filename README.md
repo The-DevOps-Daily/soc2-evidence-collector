@@ -14,6 +14,8 @@ python3 collect.py OWNER/REPO --days 90
 
 Write-up: [SOC 2 Evidence From GitHub and Terraform, and the Part That Still Needs a Person](https://devops-daily.com/posts/soc2-evidence-from-github-and-terraform)
 
+The post quotes a run from 2026-10-19 13:19 UTC. After it, the commit that added the write-up link (e9d7770) went straight to main without a pull request, by an admin bypassing the ruleset. A new run reports it as a second commit without a pull request and a second branch update that was not a PR merge: the control working as the post describes.
+
 ## What it checks
 
 | Criterion | Control | Evidence |
