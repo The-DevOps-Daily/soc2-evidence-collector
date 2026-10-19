@@ -16,8 +16,10 @@ def review(login, state="APPROVED", at="2026-10-19T11:00:00Z", commit=HEAD):
     return {"user": {"login": login}, "state": state, "submitted_at": at, "commit_id": commit}
 
 
-def run(conclusion="success", status="completed", done="2026-10-19T11:30:00Z", name="test", app=15368):
-    return {"name": name, "app": {"id": app}, "status": status, "conclusion": conclusion, "completed_at": done}
+def run(conclusion="success", status="completed", done="2026-10-19T11:30:00Z", name="test", app=15368,
+        start="2026-10-19T11:20:00Z"):
+    return {"name": name, "app": {"id": app}, "status": status, "conclusion": conclusion,
+            "started_at": start, "completed_at": done}
 
 
 class Approval(unittest.TestCase):
@@ -75,7 +77,7 @@ class Checks(unittest.TestCase):
                          "not finished")
 
     def test_a_rerun_after_the_merge_does_not_hide_the_pass_before_it(self):
-        runs = [run(), run(done="2026-10-19T12:30:00Z")]
+        runs = [run(), run(start="2026-10-19T12:20:00Z", done="2026-10-19T12:30:00Z")]
         self.assertEqual(collect.checks_at_merge(PR, runs, TEST), "passed")
 
     def test_a_failure_before_the_merge(self):
@@ -83,10 +85,24 @@ class Checks(unittest.TestCase):
 
     def test_only_the_last_run_before_the_merge_counts(self):
         # An earlier pass can not hide a later failure, and a re-run that passed in time fixes an early failure.
-        pass_then_fail = [run(done="2026-10-19T11:00:00Z"), run("failure", done="2026-10-19T11:30:00Z")]
+        pass_then_fail = [run(start="2026-10-19T10:55:00Z", done="2026-10-19T11:00:00Z"),
+                          run("failure", start="2026-10-19T11:25:00Z", done="2026-10-19T11:30:00Z")]
         self.assertEqual(collect.checks_at_merge(PR, pass_then_fail, TEST), "failed")
-        fail_then_pass = [run("failure", done="2026-10-19T11:00:00Z"), run(done="2026-10-19T11:30:00Z")]
+        fail_then_pass = [run("failure", start="2026-10-19T10:55:00Z", done="2026-10-19T11:00:00Z"),
+                          run(start="2026-10-19T11:25:00Z", done="2026-10-19T11:30:00Z")]
         self.assertEqual(collect.checks_at_merge(PR, fail_then_pass, TEST), "passed")
+
+    def test_a_rerun_still_running_at_the_merge_did_not_gate_it(self):
+        # Passed at 11:00, re-run at 11:50, merged at 12:00 while the re-run was still going.
+        runs = [run(start="2026-10-19T10:55:00Z", done="2026-10-19T11:00:00Z"),
+                run(start="2026-10-19T11:50:00Z", done="2026-10-19T12:05:00Z")]
+        self.assertEqual(collect.checks_at_merge(PR, runs, TEST), "not finished")
+        self.assertEqual(collect.checks_at_merge(PR, runs[:1] + [run(start=None, done=None, status="queued",
+                                                                      conclusion=None)], TEST), "not finished")
+
+    def test_a_skipped_or_neutral_required_check_ran_no_tests(self):
+        self.assertEqual(collect.checks_at_merge(PR, [run("skipped")], TEST), "skipped")
+        self.assertEqual(collect.checks_at_merge(PR, [run("neutral")], TEST), "skipped")
 
     def test_another_check_passing_does_not_stand_in_for_the_required_one(self):
         self.assertEqual(collect.checks_at_merge(PR, [run(name="lint")], TEST), "missing")

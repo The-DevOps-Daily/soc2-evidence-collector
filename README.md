@@ -19,7 +19,7 @@ Write-up: _link added when the post is published_.
 | Criterion | Control | Evidence |
 | --- | --- | --- |
 | CC8.1 | Changes to the default branch go through a pull request | branch rules and classic protection |
-| CC8.1 | Every merged change was tested before the merge | the last run of each required check on the pull request's head commit that finished before the merge |
+| CC8.1 | Every merged change passed the required checks before the merge | the last run of each required check on the pull request's head commit that started before the merge; it must have succeeded before the merge |
 | CC8.1 | Every merged change was approved by someone other than its author | each reviewer's last decision before the merge, for the merged commit |
 | CC8.1 | Nothing reached the default branch without a pull request | each commit's merged PR into that branch, and the branch's activity log (pushes, force pushes) |
 | CC7.1 | Dependency vulnerability alerts are on | Dependabot setting |
@@ -34,7 +34,7 @@ Every control is `pass`, `fail`, `needs a person` or `incomplete`. Missing data 
 - a branch activity log that does not reach back to the start of the window;
 - a pull request or activity entry for a branch other than the one asked for.
 
-Any other API error stops the run. A required check that reports through the older commit status API, not as a check run, shows as `missing`.
+Any other API error stops the run. Only a `success` conclusion passes a required check: GitHub lets a skipped or neutral required check through, but it ran no tests, so the collector reports it as `skipped`. A required check that reports through the older commit status API, not as a check run, shows as `missing`.
 
 The pull request, commit and branch-activity controls look back over the window. The settings and the open alerts are read as they are when you run it, so run it on a schedule and keep every folder to cover a period.
 
@@ -42,7 +42,7 @@ The pull request, commit and branch-activity controls look back over the window.
 
 ```
 evidence/OWNER__REPO/<UTC time>/
-  raw/*.json        the fields each control uses from each API response, with the time it was collected
+  raw/*.json        the API fields each control uses, with the time they were collected
   summary.json      the controls, the merged PRs, and the commits and branch updates without a PR
   manifest.sha256   hashes of the raw files
 ```
