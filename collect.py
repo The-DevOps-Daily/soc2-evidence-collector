@@ -29,7 +29,6 @@ from datetime import datetime, timedelta, timezone
 
 API = "https://api.github.com"
 SEVERITIES = ("low", "medium", "high", "critical")
-PASSING = ("success", "neutral", "skipped")
 
 
 class GitHub:
@@ -165,26 +164,35 @@ def required_contexts(rules, protection):
 
 
 def checks_at_merge(pr, check_runs, required):
-    """'passed', 'failed', 'not finished' or 'missing' for the required checks when the PR was merged.
+    """'passed', 'failed', 'skipped', 'not finished' or 'missing' for the required checks when the PR was merged.
 
     Each required check is judged by its latest run on the PR's head commit
-    (with the check's name, and app when the rule names one) that finished at
-    or before the merge, so an earlier pass cannot hide a later failure. A run
-    that finished after the merge did not gate it, and a passing run of some
-    other check does not stand in for a required one.
+    (with the check's name, and app when the rule names one) that started at
+    or before the merge: that run is the check's state at the merge. If it had
+    not finished by then, the check did not gate the merge, even when an
+    earlier run passed. Runs started after the merge are re-runs and do not
+    count. Only `success` passes: a skipped or neutral check ran no tests, and
+    a passing run of some other check does not stand in for a required one.
     """
     merged = parse_time(pr["merged_at"])
     states = []
     for name, app in required:
         runs = [c for c in check_runs
                 if c["name"] == name and (app is None or (c.get("app") or {}).get("id") == app)]
-        before = sorted((c for c in runs if c.get("completed_at") and parse_time(c["completed_at"]) <= merged),
-                        key=lambda c: parse_time(c["completed_at"]))
-        if before:
-            states.append("passed" if before[-1]["conclusion"] in PASSING else "failed")
-        else:
+        # A run with no start time is treated as the latest, so it can only hold a check back.
+        started = sorted((c for c in runs if not c.get("started_at") or parse_time(c["started_at"]) <= merged),
+                         key=lambda c: c.get("started_at") or "9999")
+        if not started:
             states.append("not finished" if runs else "missing")
-    return next((s for s in ("missing", "failed", "not finished") if s in states), "passed")
+            continue
+        last = started[-1]
+        if not last.get("completed_at") or parse_time(last["completed_at"]) > merged:
+            states.append("not finished")
+        elif last["conclusion"] == "success":
+            states.append("passed")
+        else:
+            states.append("skipped" if last["conclusion"] in ("skipped", "neutral") else "failed")
+    return next((s for s in ("missing", "failed", "skipped", "not finished") if s in states), "passed")
 
 
 def alert_severity(a):
@@ -291,7 +299,7 @@ def collect(gh, repo, days, sla_days, out_root):
     save("repository", meta)
     branch = meta["default_branch"]
 
-    _, rules = gh.get(f"{base}/rules/branches/{seg(branch)}")
+    rules, rules_complete = gh.follow(f"{base}/rules/branches/{seg(branch)}")
     save("branch-rules", rules)
     status, protection = gh.get(f"{base}/branches/{seg(branch)}/protection")
     save("branch-protection-classic", protection if status == 200 else {"status": status})
@@ -310,32 +318,36 @@ def collect(gh, repo, days, sla_days, out_root):
         # filter=all keeps runs that a later re-run replaced, so the run that gated the merge is still visible.
         runs, runs_complete = gh.follow(query(f"{base}/commits/{seg(p['head']['sha'])}/check-runs", filter="all"),
                                         key="check_runs")
+        runs, on_head = only_ref(runs, lambda c: c.get("head_sha"), p["head"]["sha"])
         pr_rows.append({
             "number": p["number"],
             "merged_at": p["merged_at"],
             "approval": approval_state(p, reviews) if reviews_complete else "incomplete",
-            "checks_at_merge": checks_at_merge(p, runs, required) if runs_complete else "incomplete",
+            "checks_at_merge": checks_at_merge(p, runs, required) if runs_complete and on_head else "incomplete",
         })
         save(f"pr-{p['number']}", {
             "pull": {"number": p["number"], "title": p["title"], "author": p["user"]["login"],
-                     "merged_at": p["merged_at"], "html_url": p["html_url"]},
+                     "base": p["base"]["ref"], "merged_at": p["merged_at"], "html_url": p["html_url"]},
             "head_sha": p["head"]["sha"],
             "reviews": [{"reviewer": (r.get("user") or {}).get("login"),
                          **{k: r.get(k) for k in ("state", "submitted_at", "commit_id")}} for r in reviews],
             "check_runs": [{"name": c["name"], "app_id": (c.get("app") or {}).get("id"),
-                            **{k: c.get(k) for k in ("status", "conclusion", "completed_at")}} for c in runs],
+                            **{k: c.get(k) for k in ("head_sha", "status", "conclusion", "started_at", "completed_at")}}
+                           for c in runs],
         })
 
     commits, commits_complete = gh.follow(
         query(f"{base}/commits", sha=branch, since=since.strftime("%Y-%m-%dT%H:%M:%SZ")), limit=300)
     merged_numbers = {p["number"] for p in merged}
-    direct = []
+    direct, linked = [], []
     for c in commits:
-        _, prs = gh.get(f"{base}/commits/{seg(c['sha'])}/pulls")
-        if not linked_to_merged_pr(prs, branch, merged_numbers):
-            direct.append({"sha": c["sha"][:12], "date": c["commit"]["committer"]["date"],
-                           "message": c["commit"]["message"].splitlines()[0][:80]})
-    save("default-branch-commits-without-pr", direct)
+        prs, _ = gh.follow(f"{base}/commits/{seg(c['sha'])}/pulls")
+        row = {"sha": c["sha"][:12], "date": c["commit"]["committer"]["date"],
+               "message": c["commit"]["message"].splitlines()[0][:80],
+               "pulls": [{"number": p["number"], "base": (p.get("base") or {}).get("ref"),
+                          "merged_at": p.get("merged_at")} for p in prs]}
+        (linked if linked_to_merged_pr(prs, branch, merged_numbers) else direct).append(row)
+    save("default-branch-commits", {"without_pr": direct, "linked": linked})
 
     # Every update to the branch ref, including force pushes that left no commit behind.
     activity, activity_complete = gh.follow(query(f"{base}/activity", ref=f"refs/heads/{branch}"),
@@ -343,7 +355,7 @@ def collect(gh, repo, days, sla_days, out_root):
     activity, on_branch = only_ref(activity, lambda a: a.get("ref"), f"refs/heads/{branch}")
     activity_complete = activity_complete and on_branch
     updates = ref_updates_outside_prs(activity, since)
-    save("branch-activity", [{"type": a["activity_type"], "timestamp": a["timestamp"],
+    save("branch-activity", [{"type": a["activity_type"], "ref": a["ref"], "timestamp": a["timestamp"],
                               "actor": (a.get("actor") or {}).get("login"),
                               "before": a.get("before"), "after": a.get("after")} for a in activity])
 
@@ -351,7 +363,8 @@ def collect(gh, repo, days, sla_days, out_root):
     alerts_status, _ = gh.get(query(f"{base}/dependabot/alerts", state="open", per_page=1), allow=(403, 404))
     alerts, alerts_complete = (gh.follow(query(f"{base}/dependabot/alerts", state="open"), limit=10000)
                                if alerts_status == 200 else ([], False))
-    save("dependabot-alerts-open", {"status": alerts_status, "complete": alerts_complete,
+    # vulnerability-alerts answers 204 when Dependabot alerts are on and 404 when they are off.
+    save("dependabot-alerts-open", {"setting_status": alerts_on, "status": alerts_status, "complete": alerts_complete,
                                     "alerts": [{"number": a["number"], "created_at": a["created_at"],
                                                 "package": a["dependency"]["package"]["name"],
                                                 "severity": alert_severity(a),
@@ -401,10 +414,11 @@ def collect(gh, repo, days, sla_days, out_root):
 
     controls = [
         control("CC8.1", "Changes to the default branch go through a pull request",
-                bool(pr_rules or classic_reviews), rule_detail,
+                "pass" if pr_rules or classic_reviews else ("fail" if rules_complete else "incomplete"), rule_detail,
                 ["branch-rules.json", "branch-protection-classic.json"]),
-        control("CC8.1", "Every merged change was tested before the merge",
-                pr_control(pr_rows, "checks_at_merge", "passed", prs_complete) if required else "fail",
+        control("CC8.1", "Every merged change passed the required checks before the merge",
+                pr_control(pr_rows, "checks_at_merge", "passed", prs_complete and rules_complete) if required
+                else ("fail" if rules_complete else "incomplete"),
                 f"required: {', '.join(name for name, _ in required) or 'none'}; "
                 f"{n - len(untested)} of {n} merged PRs passed every required check before the merge"
                 + (f" ({', '.join(untested)})" if untested else ""),
@@ -415,7 +429,7 @@ def collect(gh, repo, days, sla_days, out_root):
                 + "".join(f"; {count} {state}" for state, count in sorted(not_approved.items())),
                 ["pr-*.json"]),
         control("CC8.1", "Nothing reached the default branch without a pull request",
-                push_result, push_detail, ["default-branch-commits-without-pr.json", "branch-activity.json"]),
+                push_result, push_detail, ["default-branch-commits.json", "branch-activity.json"]),
         control("CC7.1", "Dependency vulnerability alerts are on",
                 alerts_on == 204, "Dependabot alerts " + ("on" if alerts_on == 204 else "off"),
                 ["dependabot-alerts-open.json"]),
