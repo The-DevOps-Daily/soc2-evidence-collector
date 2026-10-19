@@ -1,0 +1,4 @@
+# Deliberately old versions with published advisories, so Dependabot has
+# something to report in the demo. Nothing here is installed or run.
+PyYAML==5.3
+Jinja2==2.10
