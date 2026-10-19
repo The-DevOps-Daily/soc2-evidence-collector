@@ -54,6 +54,23 @@ class GitHub:
                 return e.code, None
             raise SystemExit(f"GET {path}: HTTP {e.code} {e.read()[:200]!r}")
 
+    def follow(self, path, limit=10000):
+        """GET a list that pages with cursors (the Link header), such as Dependabot alerts."""
+        items, url = [], API + path + ("&" if "?" in path else "?") + "per_page=100"
+        while url and len(items) < limit:
+            req = urllib.request.Request(url, headers={
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/vnd.github+json",
+                "X-GitHub-Api-Version": "2022-11-28",
+                "User-Agent": "soc2-evidence-collector",
+            })
+            self.calls += 1
+            with urllib.request.urlopen(req, timeout=30) as res:
+                items.extend(json.loads(res.read()))
+                links = res.headers.get("Link") or ""
+            url = next((part.split(";")[0].strip(" <>") for part in links.split(",") if 'rel="next"' in part), None)
+        return items[:limit]
+
     def pages(self, path, limit=1000, stop=None):
         """GET every page of a list endpoint (100 per page) up to `limit` items."""
         items, page = [], 1
@@ -236,7 +253,7 @@ def collect(gh, repo, days, sla_days, out_root):
 
     alerts_on, _ = gh.get(f"/repos/{repo}/vulnerability-alerts")
     alerts_status, _ = gh.get(f"/repos/{repo}/dependabot/alerts?state=open&per_page=1", allow=(403, 404))
-    alerts = gh.pages(f"/repos/{repo}/dependabot/alerts?state=open", limit=10000) if alerts_status == 200 else []
+    alerts = gh.follow(f"/repos/{repo}/dependabot/alerts?state=open") if alerts_status == 200 else []
     save("dependabot-alerts-open", [{"number": a["number"], "created_at": a["created_at"],
                                       "package": a["dependency"]["package"]["name"],
                                       "severity": a["security_advisory"]["severity"],
