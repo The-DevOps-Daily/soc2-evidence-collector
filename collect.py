@@ -85,17 +85,28 @@ def parse_time(s):
 # --- Classification: pure functions, covered by tests/test_collect.py ---
 
 
-def independent_approval(pr, reviews):
-    """An approval from someone other than the author, submitted before the merge."""
+def approval_state(pr, reviews):
+    """'independent', 'stale' or 'none'.
+
+    Independent: someone other than the author approved the exact commit that
+    was merged, before the merge. Stale: such an approval exists, but for an
+    earlier commit, so the merged code was not the code that was approved.
+    """
     merged = parse_time(pr["merged_at"])
     author = pr["user"]["login"]
-    return any(
-        r["state"] == "APPROVED"
-        and r["user"]
-        and r["user"]["login"] != author
+    head = pr["head"]["sha"]
+    others = [
+        r for r in reviews
+        if r["state"] == "APPROVED" and r["user"] and r["user"]["login"] != author
         and parse_time(r["submitted_at"]) <= merged
-        for r in reviews
-    )
+    ]
+    if any(r.get("commit_id") == head for r in others):
+        return "independent"
+    return "stale" if others else "none"
+
+
+def independent_approval(pr, reviews):
+    return approval_state(pr, reviews) == "independent"
 
 
 def checks_state(check_runs):
@@ -129,6 +140,32 @@ def open_alerts_past_sla(alerts, now, sla_days, severities=("critical", "high"))
             late.append({"number": a["number"], "severity": sev, "age_days": age,
                          "package": a["dependency"]["package"]["name"]})
     return late
+
+
+def linked_to_merged_pr(prs, branch, merged_numbers):
+    """A default-branch commit counts as reviewed only through a PR that was
+    merged into that branch and is one of the merged PRs we evaluated."""
+    return any(
+        p.get("merged_at") and (p.get("base") or {}).get("ref") == branch and p["number"] in merged_numbers
+        for p in prs or []
+    )
+
+
+def sla_control(status, alerts, now, sla_days):
+    """(result, detail) for the alert SLA. Missing data never passes."""
+    if status != 200:
+        return "incomplete", f"could not read Dependabot alerts (HTTP {status}); check the token's access"
+    late = open_alerts_past_sla(alerts, now, sla_days)
+    return ("pass" if not late else "fail"), (
+        f"{len(alerts)} open alerts, {len(late)} critical or high past {sla_days} days")
+
+
+def direct_push_control(direct, commits, limit, branch):
+    """(result, detail). A truncated commit list cannot prove the absence of direct pushes."""
+    if len(commits) >= limit:
+        return "incomplete", f"stopped at {limit} commits on {branch}; narrow --days or raise the limit"
+    return ("pass" if not direct else "fail"), (
+        f"{len(direct)} of {len(commits)} commits on {branch} in the window are not linked to a merged PR")
 
 
 def rule_types(rules):
@@ -176,26 +213,30 @@ def collect(gh, repo, days, sla_days, out_root):
         pr_rows.append({
             "number": p["number"],
             "merged_at": p["merged_at"],
-            "independent_approval": independent_approval(p, reviews),
+            "approval": approval_state(p, reviews),
             "checks_at_merge": checks_at_merge(p, runs),
             "checks_now": checks_state(runs),
         })
         save(f"pr-{p['number']}", {"pull": {k: p[k] for k in ("number", "title", "merged_at", "html_url")},
-                                   "reviews": [{k: r[k] for k in ("state", "submitted_at")} for r in reviews],
+                                   "head_sha": p["head"]["sha"],
+                                   "reviews": [{k: r.get(k) for k in ("state", "submitted_at", "commit_id")} for r in reviews],
                                    "check_runs": [{k: c.get(k) for k in ("name", "status", "conclusion", "completed_at")} for c in runs]})
 
-    commits = gh.pages(f"/repos/{repo}/commits?sha={branch}&since={since.strftime('%Y-%m-%dT%H:%M:%SZ')}", limit=300)
+    commit_limit = 300
+    commits = gh.pages(f"/repos/{repo}/commits?sha={branch}&since={since.strftime('%Y-%m-%dT%H:%M:%SZ')}",
+                       limit=commit_limit)
+    merged_numbers = {p["number"] for p in merged}
     direct = []
     for c in commits:
         _, prs = gh.get(f"/repos/{repo}/commits/{c['sha']}/pulls")
-        if not any(pr.get("merged_at") for pr in prs or []):
+        if not linked_to_merged_pr(prs, branch, merged_numbers):
             direct.append({"sha": c["sha"][:12], "date": c["commit"]["committer"]["date"],
                            "message": c["commit"]["message"].splitlines()[0][:80]})
     save("default-branch-commits-without-pr", direct)
 
     alerts_on, _ = gh.get(f"/repos/{repo}/vulnerability-alerts")
-    status, alerts = gh.get(f"/repos/{repo}/dependabot/alerts?state=open&per_page=100", allow=(403, 404))
-    alerts = alerts if status == 200 else []
+    alerts_status, _ = gh.get(f"/repos/{repo}/dependabot/alerts?state=open&per_page=1", allow=(403, 404))
+    alerts = gh.pages(f"/repos/{repo}/dependabot/alerts?state=open", limit=10000) if alerts_status == 200 else []
     save("dependabot-alerts-open", [{"number": a["number"], "created_at": a["created_at"],
                                       "package": a["dependency"]["package"]["name"],
                                       "severity": a["security_advisory"]["severity"],
@@ -222,12 +263,15 @@ def collect(gh, repo, days, sla_days, out_root):
     required_checks = r.get("required_status_checks", {}).get("required_status_checks") or (
         ((protection or {}).get("required_status_checks") or {}).get("contexts") if isinstance(protection, dict) else None)
     n = len(pr_rows)
-    approved = sum(p["independent_approval"] for p in pr_rows)
+    approved = sum(p["approval"] == "independent" for p in pr_rows)
+    stale = sum(p["approval"] == "stale" for p in pr_rows)
     tested = sum(p["checks_at_merge"] == "passed" for p in pr_rows)
-    late = open_alerts_past_sla(alerts, now, sla_days)
+    sla_result, sla_detail = sla_control(alerts_status, alerts, now, sla_days)
+    push_result, push_detail = direct_push_control(direct, commits, commit_limit, branch)
 
     def control(cid, name, ok, detail, evidence):
-        return {"id": cid, "control": name, "result": "pass" if ok else "fail", "detail": detail, "evidence": evidence}
+        result = ok if isinstance(ok, str) else ("pass" if ok else "fail")
+        return {"id": cid, "control": name, "result": result, "detail": detail, "evidence": evidence}
 
     controls = [
         control("CC8.1", "Changes to the default branch go through a pull request",
@@ -241,18 +285,16 @@ def collect(gh, repo, days, sla_days, out_root):
                 ["branch-rules.json", "pr-*.json"]),
         control("CC8.1", "Every merged change was approved by someone other than its author",
                 n > 0 and approved == n,
-                f"{approved} of {n} merged PRs had an independent approval before the merge",
+                f"{approved} of {n} merged PRs had an independent approval of the merged commit"
+                + (f" ({stale} approved an earlier commit only)" if stale else ""),
                 ["pr-*.json"]),
         control("CC8.1", "Nothing reached the default branch without a pull request",
-                not direct,
-                f"{len(direct)} of {len(commits)} commits on {branch} in the window are not linked to a merged PR",
-                ["default-branch-commits-without-pr.json"]),
+                push_result, push_detail, ["default-branch-commits-without-pr.json"]),
         control("CC7.1", "Dependency vulnerability alerts are on",
                 alerts_on == 204, "Dependabot alerts " + ("on" if alerts_on == 204 else "off"),
                 ["dependabot-alerts-open.json"]),
         control("CC7.1", f"No critical or high alert is open past {sla_days} days",
-                not late, f"{len(alerts)} open alerts, {len(late)} critical or high past {sla_days} days",
-                ["dependabot-alerts-open.json"]),
+                sla_result, sla_detail, ["dependabot-alerts-open.json"]),
         control("CC6.1", "Secret scanning and push protection are on",
                 (sec.get("secret_scanning") or {}).get("status") == "enabled"
                 and (sec.get("secret_scanning_push_protection") or {}).get("status") == "enabled",
@@ -296,7 +338,7 @@ def main():
     for c in s["controls"]:
         print(f"  {c['id']:6} {c['result']:15} {c['control']}\n         {c['detail']}")
     print(f"evidence: {out}")
-    return 0 if all(c["result"] != "fail" for c in s["controls"]) else 1
+    return 0 if all(c["result"] not in ("fail", "incomplete") for c in s["controls"]) else 1
 
 
 if __name__ == "__main__":
