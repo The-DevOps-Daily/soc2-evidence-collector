@@ -12,7 +12,7 @@ python3 collect.py OWNER/REPO --days 90
 
 `collect.py` needs a token that is admin on the repository, in `GITHUB_TOKEN` or from a logged-in `gh`. It uses only the Python standard library.
 
-Write-up: _link added when the post is published_.
+Write-up: [SOC 2 Evidence From GitHub and Terraform, and the Part That Still Needs a Person](https://devops-daily.com/posts/soc2-evidence-from-github-and-terraform)
 
 ## What it checks
 
